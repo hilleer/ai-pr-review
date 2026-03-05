@@ -9,6 +9,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 # ── Read inputs ───────────────────────────────────────────────────────────────
 
@@ -21,6 +22,7 @@ max_diff_chars = int(os.environ.get("INPUT_MAX_DIFF_CHARS", "80000"))
 post_mode      = os.environ.get("INPUT_POST_MODE", "comment").strip().lower()
 language       = os.environ.get("INPUT_LANGUAGE", "english").strip()
 trigger_phrase = os.environ.get("INPUT_TRIGGER_PHRASE", "/ai-review").strip()
+debounce_minutes = int(os.environ.get("INPUT_DEBOUNCE_MINUTES", "1"))
 event_name     = os.environ.get("EVENT_NAME", "").strip()
 comment_body   = os.environ.get("COMMENT_BODY", "").strip()
 gh_token       = os.environ.get("GH_TOKEN", "").strip()
@@ -56,6 +58,55 @@ if event_name == "issue_comment":
     if trigger_phrase not in comment_body:
         print(f"::notice::Comment doesn't contain trigger phrase '{trigger_phrase}'. Skipping.")
         sys.exit(0)
+
+# ── Check for recent reviews (debounce) ────────────────────────────────────────
+
+if debounce_minutes > 0 and event_name == "issue_comment":
+    def gh_get(url: str) -> dict:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {gh_token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+            print(f"::warning::Failed to check recent reviews: HTTP {e.code}")
+            return {}
+        except urllib.error.URLError as e:
+            print(f"::warning::Failed to check recent reviews: {e.reason}")
+            return {}
+
+    try:
+        comments_url = f"https://api.github.com/repos/{gh_repo}/issues/{gh_pr_number}/comments"
+        comments_data = gh_get(comments_url)
+        
+        if isinstance(comments_data, list):
+            cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=debounce_minutes)
+            
+            for comment in comments_data:
+                user_login = comment.get("user", {}).get("login", "")
+                comment_body_text = comment.get("body", "")
+                created_at_str = comment.get("created_at", "")
+                
+                if user_login == "github-actions[bot]" and "## 🤖 AI Code Review" in comment_body_text:
+                    try:
+                        created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+                        if created_at > cutoff_time:
+                            print(
+                                f"::notice::Recent AI review found ({created_at_str}). "
+                                f"Skipping to prevent duplicate (debounce: {debounce_minutes}m)."
+                            )
+                            sys.exit(0)
+                    except (ValueError, TypeError):
+                        continue
+    except Exception as e:
+        print(f"::warning::Debounce check failed: {e}. Proceeding with review.")
 
 # Normalise base_url → always ends at /chat/completions
 if base_url.endswith("/chat/completions"):

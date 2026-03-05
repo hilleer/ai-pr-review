@@ -91,6 +91,7 @@ Any provider that exposes an OpenAI-compatible `/chat/completions` endpoint work
 | `base_url` | ✅ | — | Base URL of the OpenAI-compatible API |
 | `model` | ✅ | — | Model name to use |
 | `trigger_phrase` | | `/ai-review` | Comment phrase for on-demand mode |
+| `debounce_minutes` | | `1` | Minutes to wait before allowing another review (0 to disable) |
 | `system_prompt` | | built-in | Custom system prompt |
 | `language` | | `english` | Language for the review response |
 | `post_mode` | | `comment` | `comment` (PR comment) or `review` (Reviews tab) |
