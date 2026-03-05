@@ -192,7 +192,7 @@ runs:
     # ── Step 5: Run the AI review ─────────────────────────────────────────────
     - name: Run AI review
       id: run_review
-      shell: python3 {0}
+      shell: bash
       env:
         INPUT_API_KEY: ${{ inputs.api_key }}
         INPUT_BASE_URL: ${{ inputs.base_url }}
@@ -209,4 +209,4 @@ runs:
         GH_REPO: ${{ github.repository }}
         GH_PR_NUMBER: ${{ steps.pr_context.outputs.pr_number }}
         GH_SHA: ${{ steps.pr_context.outputs.head_sha }}
-      run: ${{ github.action_path }}/review.py
+      run: python3 ${{ github.action_path }}/review.py
