@@ -44,6 +44,8 @@ if not gh_repo or not gh_pr_number:
         "GitHub repo/PR context is missing — is this running on a "
         "pull_request or issue_comment event?"
     )
+if post_mode not in ("comment", "review"):
+    errors.append(f"post_mode must be 'comment' or 'review', got '{post_mode}'")
 
 if errors:
     for e in errors:
@@ -79,7 +81,7 @@ if len(diff) > max_diff_chars:
     truncated_at = max_diff_chars
     diff = diff[:truncated_at]
     last_newline = diff.rfind("\n")
-    if last_newline > 0:
+    if last_newline >= 0:
         diff = diff[:last_newline]
     diff += f"\n\n[... diff truncated at {truncated_at:,} chars to fit context window ...]"
     print(
@@ -158,7 +160,7 @@ try:
     with urllib.request.urlopen(req, timeout=180) as resp:
         result = json.loads(resp.read().decode("utf-8"))
 except urllib.error.HTTPError as e:
-    body = e.read().decode("utf-8", errors="replace")
+    body = e.read().decode("utf-8", errors="replace")[:500]
     print(f"::error::API returned HTTP {e.code}: {body}")
     sys.exit(1)
 except urllib.error.URLError as e:
@@ -180,14 +182,14 @@ if usage:
 
 # ── Post to GitHub ────────────────────────────────────────────────────────────
 
-comment_body = (
+review_comment_body = (
     f"## 🤖 AI Code Review\n\n"
     f"{review_text}\n\n"
     f"---\n"
     f"*Model: `{model}` · [ai-pr-review](https://github.com/hilleer/ai-pr-review)*"
 )
 
-def gh_post(url: str, payload: dict) -> dict:
+def gh_post(url: str, payload: dict, retries: int = 3) -> dict:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -199,26 +201,39 @@ def gh_post(url: str, payload: dict) -> dict:
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        print(f"::error::GitHub API returned HTTP {e.code}: {body}")
-        sys.exit(1)
+    last_error = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+            if e.code >= 500 and attempt < retries - 1:
+                last_error = f"HTTP {e.code}"
+                continue
+            print(f"::error::GitHub API returned HTTP {e.code}: {body}")
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                last_error = str(e.reason)
+                continue
+            print(f"::error::Failed to reach GitHub API: {e.reason}")
+            sys.exit(1)
+    print(f"::error::GitHub API failed after {retries} retries: {last_error}")
+    sys.exit(1)
 
 base_gh = f"https://api.github.com/repos/{gh_repo}"
 
 if post_mode == "review":
     gh_post(
         f"{base_gh}/pulls/{gh_pr_number}/reviews",
-        {"commit_id": gh_sha, "body": comment_body, "event": "COMMENT"},
+        {"commit_id": gh_sha, "body": review_comment_body, "event": "COMMENT"},
     )
     print("Review posted to PR Reviews tab.")
 else:
     gh_post(
         f"{base_gh}/issues/{gh_pr_number}/comments",
-        {"body": comment_body},
+        {"body": review_comment_body},
     )
     print("Review posted as PR comment.")
 
