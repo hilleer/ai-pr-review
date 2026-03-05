@@ -46,9 +46,7 @@ on:
 
 jobs:
   review:
-    if: |
-      github.event.issue.pull_request &&
-      contains(github.event.comment.body, '/ai-review')
+    if: github.event.issue.pull_request != null && contains(github.event.comment.body, '/ai-review')
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write

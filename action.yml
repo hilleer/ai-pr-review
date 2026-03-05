@@ -102,6 +102,7 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
+        GH_REPO: ${{ github.repository }}
         EVENT_NAME: ${{ github.event_name }}
         PR_NUMBER_DIRECT: ${{ github.event.pull_request.number }}
         ISSUE_NUMBER: ${{ github.event.issue.number }}
