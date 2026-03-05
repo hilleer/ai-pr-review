@@ -9,6 +9,8 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 os.environ.update({
     "INPUT_API_KEY": "test-key",
@@ -129,11 +131,182 @@ class TestOnDemandTrigger(unittest.TestCase):
         self.assertTrue(self._should_trigger("/AI-REVIEW", "/ai-review"))
 
 
+@dataclass
+class Finding:
+    file_path: str
+    line_start: int
+    line_end: int
+    severity: str
+    text: str
+    raw_line: str
+
+
+def parse_findings(review_text: str) -> List[Finding]:
+    import re
+    findings = []
+    
+    sections = {
+        'critical': r'### 🔴 Critical\s*\n(.*?)(?=### |## |$)',
+        'warning': r'### 🟡 Warning\s*\n(.*?)(?=### |## |$)',
+        'suggestion': r'### 🟢 Suggestion\s*\n(.*?)(?=### |## |$)'
+    }
+    
+    for severity, pattern in sections.items():
+        match = re.search(pattern, review_text, re.DOTALL | re.IGNORECASE)
+        if not match:
+            continue
+        
+        section_text = match.group(1)
+        lines = section_text.strip().split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            
+            file_path, line_start, line_end = extract_file_and_line(line)
+            if file_path and line_start and line_end:
+                findings.append(Finding(
+                    file_path=file_path,
+                    line_start=line_start,
+                    line_end=line_end,
+                    severity=severity,
+                    text=line,
+                    raw_line=line
+                ))
+    
+    return findings
+
+
+def extract_file_and_line(text: str) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+    import re
+    patterns = [
+        r'([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+):(\d+)-(\d+)',
+        r'([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+):(\d+)',
+        r'[Ff]ile[:\s]+([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)[,\s]+[Ll]ine[:\s]+(\d+)',
+        r'[Ii]n\s+([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)\s+at\s+line\s+(\d+)',
+        r'[Ll]ines?\s+(\d+)-?(\d+)?\s+(?:of|in)\s+([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            groups = match.groups()
+            
+            if pattern == patterns[0]:
+                return groups[0], int(groups[1]), int(groups[2])
+            elif pattern == patterns[1]:
+                return groups[0], int(groups[1]), int(groups[1])
+            elif pattern in [patterns[2], patterns[3]]:
+                return groups[0], int(groups[1]), int(groups[1])
+            elif pattern == patterns[4]:
+                file_path = groups[2]
+                line_start = int(groups[0])
+                line_end = int(groups[1]) if groups[1] else line_start
+                return file_path, line_start, line_end
+    
+    return None, None, None
+
+
+def compare_findings(old: List[Finding], new: List[Finding], line_tolerance: int = 5) -> Tuple[List[Finding], List[Finding]]:
+    resolved = []
+    persisting = []
+    
+    for old_finding in old:
+        is_resolved = True
+        
+        for new_finding in new:
+            if (old_finding.file_path == new_finding.file_path and
+                abs(old_finding.line_start - new_finding.line_start) <= line_tolerance):
+                is_resolved = False
+                persisting.append(old_finding)
+                break
+        
+        if is_resolved:
+            resolved.append(old_finding)
+    
+    return resolved, persisting
+
+
+class TestFindingsParser(unittest.TestCase):
+    def test_parse_simple_file_line(self):
+        text = "### 🔴 Critical\n- src/auth.py:45 - SQL injection vulnerability"
+        findings = parse_findings(text)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].file_path, "src/auth.py")
+        self.assertEqual(findings[0].line_start, 45)
+        self.assertEqual(findings[0].line_end, 45)
+        self.assertEqual(findings[0].severity, "critical")
+    
+    def test_parse_file_line_range(self):
+        text = "### 🟡 Warning\n- src/api.py:123-125 - Missing error handling"
+        findings = parse_findings(text)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].file_path, "src/api.py")
+        self.assertEqual(findings[0].line_start, 123)
+        self.assertEqual(findings[0].line_end, 125)
+    
+    def test_parse_multiple_sections(self):
+        text = """### 🔴 Critical
+- src/auth.py:45 - SQL injection
+
+### 🟡 Warning
+- src/api.py:123 - Missing validation
+
+### 🟢 Suggestion
+- src/utils.py:10 - Improve naming"""
+        findings = parse_findings(text)
+        self.assertEqual(len(findings), 3)
+        severities = [f.severity for f in findings]
+        self.assertIn('critical', severities)
+        self.assertIn('warning', severities)
+        self.assertIn('suggestion', severities)
+    
+    def test_empty_sections(self):
+        text = "## Summary\n\nThis PR is clean"
+        findings = parse_findings(text)
+        self.assertEqual(len(findings), 0)
+
+
+class TestFindingsComparison(unittest.TestCase):
+    def test_exact_match(self):
+        old = [Finding("src/auth.py", 45, 45, "critical", "SQL injection", "SQL injection")]
+        new = [Finding("src/auth.py", 45, 45, "critical", "SQL injection", "SQL injection")]
+        resolved, persisting = compare_findings(old, new)
+        self.assertEqual(len(resolved), 0)
+        self.assertEqual(len(persisting), 1)
+    
+    def test_line_tolerance(self):
+        old = [Finding("src/auth.py", 45, 45, "critical", "Issue", "Issue")]
+        new = [Finding("src/auth.py", 47, 47, "critical", "Issue", "Issue")]
+        resolved, persisting = compare_findings(old, new)
+        self.assertEqual(len(resolved), 0)
+        self.assertEqual(len(persisting), 1)
+    
+    def test_resolved_finding(self):
+        old = [
+            Finding("src/auth.py", 45, 45, "critical", "SQL injection", "SQL injection"),
+            Finding("src/api.py", 123, 123, "warning", "Missing validation", "Missing validation"),
+        ]
+        new = [Finding("src/auth.py", 45, 45, "critical", "SQL injection", "SQL injection")]
+        resolved, persisting = compare_findings(old, new)
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(len(persisting), 1)
+        self.assertEqual(resolved[0].file_path, "src/api.py")
+    
+    def test_different_files(self):
+        old = [Finding("src/auth.py", 45, 45, "critical", "Issue", "Issue")]
+        new = [Finding("src/api.py", 45, 45, "critical", "Issue", "Issue")]
+        resolved, persisting = compare_findings(old, new)
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(len(persisting), 0)
+
+
 if __name__ == "__main__":
     print("Running ai-pr-review smoke tests...\n")
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    for cls in [TestURLNormalisation, TestDiffHandling, TestLanguageNote, TestOnDemandTrigger]:
+    for cls in [TestURLNormalisation, TestDiffHandling, TestLanguageNote, TestOnDemandTrigger, TestFindingsParser, TestFindingsComparison]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

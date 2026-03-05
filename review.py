@@ -6,9 +6,12 @@ Works with both pull_request and issue_comment trigger events.
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 # ── Read inputs ───────────────────────────────────────────────────────────────
 
@@ -27,6 +30,99 @@ gh_token       = os.environ.get("GH_TOKEN", "").strip()
 gh_repo        = os.environ.get("GH_REPO", "").strip()
 gh_pr_number   = os.environ.get("GH_PR_NUMBER", "").strip()
 gh_sha         = os.environ.get("GH_SHA", "").strip()
+
+# ── Findings Parser ───────────────────────────────────────────────────────────
+
+@dataclass
+class Finding:
+    file_path: str
+    line_start: int
+    line_end: int
+    severity: str
+    text: str
+    raw_line: str
+
+def parse_findings(review_text: str) -> List[Finding]:
+    findings = []
+    
+    sections = {
+        'critical': r'### 🔴 Critical\s*\n(.*?)(?=### |## |$)',
+        'warning': r'### 🟡 Warning\s*\n(.*?)(?=### |## |$)',
+        'suggestion': r'### 🟢 Suggestion\s*\n(.*?)(?=### |## |$)'
+    }
+    
+    for severity, pattern in sections.items():
+        match = re.search(pattern, review_text, re.DOTALL | re.IGNORECASE)
+        if not match:
+            continue
+        
+        section_text = match.group(1)
+        lines = section_text.strip().split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            
+            file_path, line_start, line_end = extract_file_and_line(line)
+            if file_path and line_start and line_end:
+                findings.append(Finding(
+                    file_path=file_path,
+                    line_start=line_start,
+                    line_end=line_end,
+                    severity=severity,
+                    text=line,
+                    raw_line=line
+                ))
+    
+    return findings
+
+def extract_file_and_line(text: str) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+    patterns = [
+        r'([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+):(\d+)-(\d+)',
+        r'([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+):(\d+)',
+        r'[Ff]ile[:\s]+([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)[,\s]+[Ll]ine[:\s]+(\d+)',
+        r'[Ii]n\s+([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)\s+at\s+line\s+(\d+)',
+        r'[Ll]ines?\s+(\d+)-?(\d+)?\s+(?:of|in)\s+([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            groups = match.groups()
+            
+            if pattern == patterns[0]:
+                return groups[0], int(groups[1]), int(groups[2])
+            elif pattern == patterns[1]:
+                return groups[0], int(groups[1]), int(groups[1])
+            elif pattern in [patterns[2], patterns[3]]:
+                return groups[0], int(groups[1]), int(groups[1])
+            elif pattern == patterns[4]:
+                file_path = groups[2]
+                line_start = int(groups[0])
+                line_end = int(groups[1]) if groups[1] else line_start
+                return file_path, line_start, line_end
+    
+    return None, None, None
+
+def compare_findings(old: List[Finding], new: List[Finding], line_tolerance: int = 5) -> Tuple[List[Finding], List[Finding]]:
+    resolved = []
+    persisting = []
+    
+    for old_finding in old:
+        is_resolved = True
+        
+        for new_finding in new:
+            if (old_finding.file_path == new_finding.file_path and
+                abs(old_finding.line_start - new_finding.line_start) <= line_tolerance):
+                is_resolved = False
+                persisting.append(old_finding)
+                break
+        
+        if is_resolved:
+            resolved.append(old_finding)
+    
+    return resolved, persisting
 
 # ── Validate ──────────────────────────────────────────────────────────────────
 
@@ -182,11 +278,15 @@ if usage:
 
 # ── Post to GitHub ────────────────────────────────────────────────────────────
 
+from datetime import datetime
+
+timestamp = datetime.utcnow().isoformat() + "Z"
 review_comment_body = (
-    f"## 🤖 AI Code Review\n\n"
+    f"## 🤖 AI Code Review\n"
+    f"<!-- ai-pr-review sha={gh_sha} timestamp={timestamp} -->\n\n"
     f"{review_text}\n\n"
     f"---\n"
-    f"*Model: `{model}` · [ai-pr-review](https://github.com/hilleer/ai-pr-review)*"
+    f"*Model: `{model}` · Commit: `{gh_sha[:7]}` · [ai-pr-review](https://github.com/hilleer/ai-pr-review)*"
 )
 
 def gh_post(url: str, payload: dict, retries: int = 3) -> dict:
@@ -222,15 +322,164 @@ def gh_post(url: str, payload: dict, retries: int = 3) -> dict:
     print(f"::error::GitHub API failed after {retries} retries: {last_error}")
     sys.exit(1)
 
+def gh_get(url: str, retries: int = 3) -> dict:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {gh_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    last_error = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+            if e.code >= 500 and attempt < retries - 1:
+                last_error = f"HTTP {e.code}"
+                continue
+            print(f"::error::GitHub API returned HTTP {e.code}: {body}")
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                last_error = str(e.reason)
+                continue
+            print(f"::error::Failed to reach GitHub API: {e.reason}")
+            sys.exit(1)
+    print(f"::error::GitHub API failed after {retries} retries: {last_error}")
+    sys.exit(1)
+
+def gh_patch(url: str, payload: dict, retries: int = 3) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {gh_token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method="PATCH",
+    )
+    last_error = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+            if e.code >= 500 and attempt < retries - 1:
+                last_error = f"HTTP {e.code}"
+                continue
+            print(f"::error::GitHub API returned HTTP {e.code}: {body}")
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                last_error = str(e.reason)
+                continue
+            print(f"::error::Failed to reach GitHub API: {e.reason}")
+            sys.exit(1)
+    print(f"::error::GitHub API failed after {retries} retries: {last_error}")
+    sys.exit(1)
+
+def gh_list_pr_comments(pr_number: int) -> List[dict]:
+    url = f"{base_gh}/issues/{pr_number}/comments"
+    try:
+        result = gh_get(url)
+        return result if isinstance(result, list) else []
+    except Exception as e:
+        print(f"::warning::Failed to list PR comments: {e}")
+        return []
+
+def gh_edit_comment(comment_id: int, body: str) -> dict:
+    url = f"{base_gh}/issues/comments/{comment_id}"
+    return gh_patch(url, {"body": body})
+
+def find_last_ai_review_comment(comments: List[dict]) -> Optional[dict]:
+    for comment in reversed(comments):
+        body = comment.get("body", "")
+        if "<!-- ai-pr-review" in body:
+            return comment
+    return None
+
+def extract_sha_from_comment(body: str) -> Optional[str]:
+    match = re.search(r'<!-- ai-pr-review sha=([a-f0-9]+)', body)
+    return match.group(1) if match else None
+
+def format_resolved_finding(finding: Finding, resolved_sha: str) -> str:
+    return f"- ~~{finding.raw_line}~~ ✅ Resolved in {resolved_sha[:7]}"
+
+def mark_findings_resolved(comment_body: str, resolved_findings: List[Finding], resolved_sha: str) -> str:
+    lines = comment_body.split('\n')
+    updated_lines = []
+    
+    for line in lines:
+        modified = False
+        for finding in resolved_findings:
+            if finding.raw_line in line and not line.strip().startswith('~~'):
+                if line.strip().startswith('- '):
+                    indent_match = re.match(r'^(\s*- )(.*)$', line)
+                    if indent_match:
+                        indent = indent_match.group(1)
+                        content = indent_match.group(2)
+                        updated_lines.append(f"{indent}~~{content}~~ ✅ Resolved in {resolved_sha[:7]}")
+                        modified = True
+                        break
+        
+        if not modified:
+            updated_lines.append(line)
+    
+    return '\n'.join(updated_lines)
+
 base_gh = f"https://api.github.com/repos/{gh_repo}"
 
 if post_mode == "review":
+    comments = gh_list_pr_comments(int(gh_pr_number))
+    last_comment = find_last_ai_review_comment(comments)
+    
+    if last_comment:
+        old_body = last_comment.get("body", "")
+        old_findings = parse_findings(old_body)
+        new_findings = parse_findings(review_text)
+        resolved_findings, _ = compare_findings(old_findings, new_findings)
+        
+        if resolved_findings:
+            print(f"Marking {len(resolved_findings)} resolved findings in previous comment...")
+            updated_body = mark_findings_resolved(old_body, resolved_findings, gh_sha)
+            try:
+                gh_edit_comment(last_comment["id"], updated_body)
+                print(f"Updated previous review comment (ID: {last_comment['id']})")
+            except Exception as e:
+                print(f"::warning::Failed to edit previous comment: {e}")
+    
     gh_post(
         f"{base_gh}/pulls/{gh_pr_number}/reviews",
         {"commit_id": gh_sha, "body": review_comment_body, "event": "COMMENT"},
     )
     print("Review posted to PR Reviews tab.")
 else:
+    comments = gh_list_pr_comments(int(gh_pr_number))
+    last_comment = find_last_ai_review_comment(comments)
+    
+    if last_comment:
+        old_body = last_comment.get("body", "")
+        old_findings = parse_findings(old_body)
+        new_findings = parse_findings(review_text)
+        resolved_findings, _ = compare_findings(old_findings, new_findings)
+        
+        if resolved_findings:
+            print(f"Marking {len(resolved_findings)} resolved findings in previous comment...")
+            updated_body = mark_findings_resolved(old_body, resolved_findings, gh_sha)
+            try:
+                gh_edit_comment(last_comment["id"], updated_body)
+                print(f"Updated previous review comment (ID: {last_comment['id']})")
+            except Exception as e:
+                print(f"::warning::Failed to edit previous comment: {e}")
+    
     gh_post(
         f"{base_gh}/issues/{gh_pr_number}/comments",
         {"body": review_comment_body},
