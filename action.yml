@@ -37,6 +37,14 @@ inputs:
     required: false
     default: '/ai-review'
 
+  debounce_minutes:
+    description: |
+      Minutes to wait before allowing another review on the same PR.
+      Prevents duplicate reviews from accidental double-clicks.
+      Set to 0 to disable debouncing.
+    required: false
+    default: '1'
+
   system_prompt:
     description: 'Custom system prompt. Leave empty to use the built-in code review prompt.'
     required: false
@@ -61,15 +69,6 @@ inputs:
     description: 'Maximum characters of diff to send. Increase for models with large context windows.'
     required: false
     default: '80000'
-
-  post_mode:
-    description: |
-      How to post the review:
-        comment  - Single PR comment (default, works everywhere)
-        review   - GitHub PR Review (shows in the Reviews tab, informational only)
-      Note: 'review' mode posts as COMMENT event (doesn't approve or request changes).
-    required: false
-    default: 'comment'
 
   language:
     description: 'Language for the review response (e.g. english, danish, german)'
@@ -200,9 +199,9 @@ runs:
         INPUT_SYSTEM_PROMPT: ${{ inputs.system_prompt }}
         INPUT_MAX_TOKENS: ${{ inputs.max_tokens }}
         INPUT_MAX_DIFF_CHARS: ${{ inputs.max_diff_chars }}
-        INPUT_POST_MODE: ${{ inputs.post_mode }}
         INPUT_LANGUAGE: ${{ inputs.language }}
         INPUT_TRIGGER_PHRASE: ${{ inputs.trigger_phrase }}
+        INPUT_DEBOUNCE_MINUTES: ${{ inputs.debounce_minutes }}
         EVENT_NAME: ${{ github.event_name }}
         COMMENT_BODY: ${{ github.event.comment.body }}
         GH_TOKEN: ${{ inputs.github_token }}

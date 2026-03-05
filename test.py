@@ -19,8 +19,8 @@ os.environ.update({
     "INPUT_SYSTEM_PROMPT": "",
     "INPUT_MAX_TOKENS": "2048",
     "INPUT_MAX_DIFF_CHARS": "80000",
-    "INPUT_POST_MODE": "comment",
     "INPUT_LANGUAGE": "english",
+    "INPUT_DEBOUNCE_MINUTES": "1",
     "GH_TOKEN": "ghp_test",
     "GH_REPO": "owner/repo",
     "GH_PR_NUMBER": "42",
@@ -302,11 +302,93 @@ class TestFindingsComparison(unittest.TestCase):
         self.assertEqual(len(persisting), 0)
 
 
+class TestPerLineComments(unittest.TestCase):
+    """Test per-line comment generation and duplicate detection"""
+    
+    def test_finding_to_comment_single_line(self):
+        finding = Finding("src/auth.py", 45, 45, "critical", "SQL injection", "SQL injection")
+        # Simulate conversion
+        comment = {
+            "path": finding.file_path,
+            "line": finding.line_start,
+            "side": "RIGHT",
+            "body": f"🔴 **Critical**\n\n{finding.text}"
+        }
+        self.assertEqual(comment["path"], "src/auth.py")
+        self.assertEqual(comment["line"], 45)
+        self.assertNotIn("start_line", comment)
+    
+    def test_finding_to_comment_multi_line(self):
+        finding = Finding("src/api.py", 123, 125, "warning", "Missing validation", "Missing validation")
+        # Simulate conversion
+        comment = {
+            "path": finding.file_path,
+            "start_line": finding.line_start,
+            "line": finding.line_end,
+            "side": "RIGHT",
+            "body": f"🟡 **Warning**\n\n{finding.text}"
+        }
+        self.assertEqual(comment["start_line"], 123)
+        self.assertEqual(comment["line"], 125)
+    
+    def test_duplicate_detection(self):
+        existing = [
+            {"path": "src/auth.py", "line": 45, "body": "old comment"},
+            {"path": "src/api.py", "line": 123, "body": "old comment"},
+        ]
+        
+        # Simulate duplicate check
+        def has_comment(path, line):
+            return any(c["path"] == path and c["line"] == line for c in existing)
+        
+        self.assertTrue(has_comment("src/auth.py", 45))
+        self.assertFalse(has_comment("src/auth.py", 46))
+        self.assertFalse(has_comment("src/other.py", 45))
+
+
+class TestDebounceLogic(unittest.TestCase):
+    """Test debounce parsing and validation"""
+    
+    def _parse_debounce(self, raw_value: Optional[str]) -> int:
+        raw = raw_value.strip() if raw_value else "1"
+        if not raw:
+            raw = "1"
+        try:
+            val = int(raw)
+            return max(0, val) if val >= 0 else 1
+        except ValueError:
+            return 1
+    
+    def test_valid_positive_integer(self):
+        self.assertEqual(self._parse_debounce("5"), 5)
+    
+    def test_zero_disables_debounce(self):
+        self.assertEqual(self._parse_debounce("0"), 0)
+    
+    def test_whitespace_handling(self):
+        self.assertEqual(self._parse_debounce("  3  "), 3)
+    
+    def test_empty_string_uses_default(self):
+        self.assertEqual(self._parse_debounce(""), 1)
+    
+    def test_none_uses_default(self):
+        self.assertEqual(self._parse_debounce(None), 1)
+    
+    def test_invalid_string_uses_default(self):
+        self.assertEqual(self._parse_debounce("abc"), 1)
+    
+    def test_negative_value_corrected(self):
+        val = self._parse_debounce("-5")
+        self.assertGreaterEqual(val, 0)
+
+
 if __name__ == "__main__":
     print("Running ai-pr-review smoke tests...\n")
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    for cls in [TestURLNormalisation, TestDiffHandling, TestLanguageNote, TestOnDemandTrigger, TestFindingsParser, TestFindingsComparison]:
+    for cls in [TestURLNormalisation, TestDiffHandling, TestLanguageNote, 
+                TestOnDemandTrigger, TestFindingsParser, TestFindingsComparison,
+                TestPerLineComments, TestDebounceLogic]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

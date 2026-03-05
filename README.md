@@ -91,9 +91,9 @@ Any provider that exposes an OpenAI-compatible `/chat/completions` endpoint work
 | `base_url` | ✅ | — | Base URL of the OpenAI-compatible API |
 | `model` | ✅ | — | Model name to use |
 | `trigger_phrase` | | `/ai-review` | Comment phrase for on-demand mode |
+| `debounce_minutes` | | `1` | Minutes to wait before allowing another review (0 to disable) |
 | `system_prompt` | | built-in | Custom system prompt |
 | `language` | | `english` | Language for the review response |
-| `post_mode` | | `comment` | `comment` (PR comment) or `review` (Reviews tab) |
 | `max_tokens` | | `2048` | Max tokens in the model response |
 | `max_diff_chars` | | `80000` | Max diff size sent to the model |
 | `file_patterns` | | `*.ts,*.tsx,...` | Glob patterns of files to include |
@@ -106,6 +106,40 @@ Any provider that exposes an OpenAI-compatible `/chat/completions` endpoint work
 |---|---|
 | `review_body` | First 1000 chars of the review text |
 | `model_used` | The model that performed the review |
+
+---
+
+## Review Format
+
+The action posts a **PR Review** (similar to GitHub Copilot) with:
+
+1. **Summary comment** - Overall assessment with all findings grouped by severity
+2. **Per-line comments** - Individual comments on specific lines for each finding
+
+**Benefits:**
+- Per-line comments appear inline in the diff for easy reference
+- GitHub automatically marks comments as "outdated" when code changes
+- Resolved findings are tracked and marked with strikethrough in the summary
+- Duplicate detection prevents re-commenting on the same lines
+
+**Example:**
+
+Summary:
+```
+## Summary
+This PR adds authentication middleware...
+
+## Findings
+### 🔴 Critical
+- ~~src/auth.py:45 - SQL injection~~ ✅ Resolved in abc1234
+- src/api.py:67 - Missing rate limiting
+
+## Verdict
+⚠️ Needs minor changes
+```
+
+Per-line comments:
+- Line 67 in `src/api.py`: 🔴 **Critical** - Missing rate limiting
 
 ---
 

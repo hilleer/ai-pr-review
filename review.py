@@ -11,7 +11,8 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Tuple, Union
 
 # ── Read inputs ───────────────────────────────────────────────────────────────
 
@@ -21,9 +22,23 @@ model          = os.environ.get("INPUT_MODEL", "").strip()
 system_prompt  = os.environ.get("INPUT_SYSTEM_PROMPT", "").strip()
 max_tokens     = int(os.environ.get("INPUT_MAX_TOKENS", "2048"))
 max_diff_chars = int(os.environ.get("INPUT_MAX_DIFF_CHARS", "80000"))
-post_mode      = os.environ.get("INPUT_POST_MODE", "comment").strip().lower()
 language       = os.environ.get("INPUT_LANGUAGE", "english").strip()
 trigger_phrase = os.environ.get("INPUT_TRIGGER_PHRASE", "/ai-review").strip()
+
+# Parse debounce_minutes with validation
+raw_debounce = os.environ.get("INPUT_DEBOUNCE_MINUTES", "1")
+raw_debounce = raw_debounce.strip() if raw_debounce else "1"
+if not raw_debounce:
+    raw_debounce = "1"
+try:
+    debounce_minutes = int(raw_debounce)
+    if debounce_minutes < 0:
+        print("::warning::debounce_minutes cannot be negative, using default 1")
+        debounce_minutes = 1
+except ValueError:
+    print(f"::warning::Invalid INPUT_DEBOUNCE_MINUTES value '{raw_debounce}', using default 1")
+    debounce_minutes = 1
+
 event_name     = os.environ.get("EVENT_NAME", "").strip()
 comment_body   = os.environ.get("COMMENT_BODY", "").strip()
 gh_token       = os.environ.get("GH_TOKEN", "").strip()
@@ -140,8 +155,6 @@ if not gh_repo or not gh_pr_number:
         "GitHub repo/PR context is missing — is this running on a "
         "pull_request or issue_comment event?"
     )
-if post_mode not in ("comment", "review"):
-    errors.append(f"post_mode must be 'comment' or 'review', got '{post_mode}'")
 
 if errors:
     for e in errors:
@@ -152,6 +165,32 @@ if event_name == "issue_comment":
     if trigger_phrase not in comment_body:
         print(f"::notice::Comment doesn't contain trigger phrase '{trigger_phrase}'. Skipping.")
         sys.exit(0)
+
+# ── Check for recent reviews (debounce) ────────────────────────────────────────
+
+if debounce_minutes > 0 and event_name == "issue_comment":
+    cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=debounce_minutes)
+    
+    # Check PR reviews (not issue comments)
+    reviews_url = f"https://api.github.com/repos/{gh_repo}/pulls/{gh_pr_number}/reviews?per_page=100"
+    reviews_data = gh_get(reviews_url)
+    
+    if isinstance(reviews_data, list):
+        for review in reviews_data:
+            user_login = review.get("user", {}).get("login", "")
+            submitted_at_str = review.get("submitted_at", "")
+            
+            if user_login == "github-actions[bot]":
+                try:
+                    submitted_at = datetime.fromisoformat(submitted_at_str.replace("Z", "+00:00"))
+                    if submitted_at > cutoff_time:
+                        print(
+                            f"::notice::Recent AI review found ({submitted_at_str}). "
+                            f"Skipping to prevent duplicate (debounce: {debounce_minutes}m)."
+                        )
+                        sys.exit(0)
+                except (ValueError, TypeError):
+                    continue
 
 # Normalise base_url → always ends at /chat/completions
 if base_url.endswith("/chat/completions"):
@@ -322,7 +361,7 @@ def gh_post(url: str, payload: dict, retries: int = 3) -> dict:
     print(f"::error::GitHub API failed after {retries} retries: {last_error}")
     sys.exit(1)
 
-def gh_get(url: str, retries: int = 3) -> dict:
+def gh_get(url: str, retries: int = 3) -> Union[dict, list]:
     req = urllib.request.Request(
         url,
         headers={
@@ -435,56 +474,181 @@ def mark_findings_resolved(comment_body: str, resolved_findings: List[Finding], 
     
     return '\n'.join(updated_lines)
 
+# ── Per-line comment helpers ──────────────────────────────────────────────────
+
+def gh_list_review_comments(pr_number: int, commit_id: str) -> List[dict]:
+    """
+    Fetch all review comments for a specific commit.
+    Returns comments with path, line, and body.
+    """
+    url = f"{base_gh}/pulls/{pr_number}/comments"
+    params = "?per_page=100&sort=created&direction=desc"
+    
+    all_comments = []
+    page = 1
+    
+    while page <= 10:  # Safety limit: 1000 comments
+        result = gh_get(f"{url}{params}&page={page}")
+        
+        if not isinstance(result, list) or not result:
+            break
+        
+        for comment in result:
+            # Only include comments on the current commit
+            if comment.get("commit_id") == commit_id:
+                all_comments.append({
+                    "path": comment.get("path"),
+                    "line": comment.get("line") or comment.get("original_line"),
+                    "body": comment.get("body", "")
+                })
+        
+        if len(result) < 100:  # Last page
+            break
+        
+        page += 1
+    
+    return all_comments
+
+def has_existing_comment(path: str, line: int, existing_comments: List[dict]) -> bool:
+    """
+    Check if a line already has a review comment.
+    Returns True if duplicate detected.
+    """
+    for comment in existing_comments:
+        if comment["path"] == path and comment["line"] == line:
+            return True
+    return False
+
+def findings_to_review_comments(findings: List[Finding]) -> List[dict]:
+    """
+    Convert parsed findings to GitHub review comment format.
+    Returns array suitable for PR review API.
+    """
+    comments = []
+    
+    severity_emoji = {
+        "critical": "🔴",
+        "warning": "🟡",
+        "suggestion": "🟢"
+    }
+    
+    for finding in findings:
+        # Skip findings without valid file/line info
+        if not finding.file_path or not finding.line_start:
+            continue
+        
+        emoji = severity_emoji.get(finding.severity, "⚠️")
+        comment_body = f"{emoji} **{finding.severity.title()}**\n\n{finding.text}"
+        
+        # Support multi-line ranges
+        if finding.line_end and finding.line_end != finding.line_start:
+            comments.append({
+                "path": finding.file_path,
+                "start_line": finding.line_start,
+                "line": finding.line_end,
+                "side": "RIGHT",
+                "body": comment_body
+            })
+        else:
+            comments.append({
+                "path": finding.file_path,
+                "line": finding.line_start,
+                "side": "RIGHT",
+                "body": comment_body
+            })
+    
+    return comments
+
 base_gh = f"https://api.github.com/repos/{gh_repo}"
 
-if post_mode == "review":
-    comments = gh_list_pr_comments(int(gh_pr_number))
-    last_comment = find_last_ai_review_comment(comments)
+# ── Prepare PR Review ─────────────────────────────────────────────────────────
+
+# Fetch existing review comments on current commit
+existing_comments = gh_list_review_comments(int(gh_pr_number), gh_sha)
+print(f"Found {len(existing_comments)} existing review comments on this commit")
+
+# Parse findings from new review
+new_findings = parse_findings(review_text)
+
+# Filter out findings for lines already commented
+filtered_findings = [
+    f for f in new_findings
+    if not has_existing_comment(f.file_path, f.line_start, existing_comments)
+]
+
+skipped_count = len(new_findings) - len(filtered_findings)
+if skipped_count > 0:
+    print(f"Skipping {skipped_count} findings (already commented)")
+
+# Convert findings to review comments
+review_comments = findings_to_review_comments(filtered_findings)
+
+# ── Mark resolved findings in previous summary ────────────────────────────────
+
+# Find last AI review to check for resolved findings
+reviews_url = f"{base_gh}/pulls/{gh_pr_number}/reviews?per_page=100"
+reviews = gh_get(reviews_url)
+
+last_ai_review = None
+if isinstance(reviews, list):
+    for review in reviews:
+        if review.get("user", {}).get("login") == "github-actions[bot]":
+            last_ai_review = review
+            break
+
+if last_ai_review:
+    old_body = last_ai_review.get("body", "")
+    old_findings = parse_findings(old_body)
+    resolved_findings, _ = compare_findings(old_findings, new_findings)
     
-    if last_comment:
-        old_body = last_comment.get("body", "")
-        old_findings = parse_findings(old_body)
-        new_findings = parse_findings(review_text)
-        resolved_findings, _ = compare_findings(old_findings, new_findings)
+    if resolved_findings:
+        print(f"Marking {len(resolved_findings)} resolved findings in previous review...")
+        updated_body = mark_findings_resolved(old_body, resolved_findings, gh_sha)
         
-        if resolved_findings:
-            print(f"Marking {len(resolved_findings)} resolved findings in previous comment...")
-            updated_body = mark_findings_resolved(old_body, resolved_findings, gh_sha)
-            try:
-                gh_edit_comment(last_comment["id"], updated_body)
-                print(f"Updated previous review comment (ID: {last_comment['id']})")
-            except Exception as e:
-                print(f"::warning::Failed to edit previous comment: {e}")
-    
+        # Update the previous review's body
+        review_id = last_ai_review["id"]
+        try:
+            gh_patch(
+                f"{base_gh}/pulls/{gh_pr_number}/reviews/{review_id}",
+                {"body": updated_body}
+            )
+            print(f"Updated previous review (ID: {review_id})")
+        except Exception as e:
+            print(f"::warning::Failed to update previous review: {e}")
+
+# ── Post new PR Review ────────────────────────────────────────────────────────
+
+review_payload = {
+    "commit_id": gh_sha,
+    "body": review_comment_body,
+    "event": "COMMENT"
+}
+
+# Only include comments if we have any
+if review_comments:
+    review_payload["comments"] = review_comments
+
+try:
     gh_post(
         f"{base_gh}/pulls/{gh_pr_number}/reviews",
-        {"commit_id": gh_sha, "body": review_comment_body, "event": "COMMENT"},
+        review_payload
     )
-    print("Review posted to PR Reviews tab.")
-else:
-    comments = gh_list_pr_comments(int(gh_pr_number))
-    last_comment = find_last_ai_review_comment(comments)
-    
-    if last_comment:
-        old_body = last_comment.get("body", "")
-        old_findings = parse_findings(old_body)
-        new_findings = parse_findings(review_text)
-        resolved_findings, _ = compare_findings(old_findings, new_findings)
-        
-        if resolved_findings:
-            print(f"Marking {len(resolved_findings)} resolved findings in previous comment...")
-            updated_body = mark_findings_resolved(old_body, resolved_findings, gh_sha)
-            try:
-                gh_edit_comment(last_comment["id"], updated_body)
-                print(f"Updated previous review comment (ID: {last_comment['id']})")
-            except Exception as e:
-                print(f"::warning::Failed to edit previous comment: {e}")
-    
-    gh_post(
-        f"{base_gh}/issues/{gh_pr_number}/comments",
-        {"body": review_comment_body},
-    )
-    print("Review posted as PR comment.")
+    print(f"✅ Posted review with {len(review_comments)} inline comments")
+except urllib.error.HTTPError as e:
+    # If review with comments fails, try posting summary only
+    if e.code == 422 and review_comments:
+        print("::warning::Some inline comments invalid, posting summary only")
+        gh_post(
+            f"{base_gh}/pulls/{gh_pr_number}/reviews",
+            {
+                "commit_id": gh_sha,
+                "body": review_comment_body,
+                "event": "COMMENT"
+            }
+        )
+        print("✅ Posted summary review (inline comments skipped)")
+    else:
+        raise
 
 # ── Set action outputs ────────────────────────────────────────────────────────
 
