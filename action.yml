@@ -29,6 +29,14 @@ inputs:
     description: 'Model name (e.g. kimi-k2-0711-preview, glm-4-plus, gpt-4o, mistral-large-latest)'
     required: true
 
+  trigger_phrase:
+    description: |
+      Comment phrase that triggers an on-demand review.
+      Only relevant when using the issue_comment event trigger.
+      Example: /ai-review
+    required: false
+    default: '/ai-review'
+
   system_prompt:
     description: 'Custom system prompt. Leave empty to use the built-in code review prompt.'
     required: false
@@ -84,35 +92,84 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    # ── Step 1: Resolve PR context ─────────────────────────────────────────────
+    # gh pr view works for both triggers:
+    #   pull_request  → PR number is in the event payload
+    #   issue_comment → issue number == PR number; gh fetches the rest
+    - name: Resolve PR context
+      id: pr_context
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_NUMBER_DIRECT: ${{ github.event.pull_request.number }}
+        ISSUE_NUMBER: ${{ github.event.issue.number }}
+      run: |
+        if [ "$EVENT_NAME" = "issue_comment" ]; then
+          echo "Triggered via issue_comment — resolving PR context with gh..."
+          PR_NUMBER="$ISSUE_NUMBER"
+        else
+          echo "Triggered via pull_request — resolving PR context with gh..."
+          PR_NUMBER="$PR_NUMBER_DIRECT"
+        fi
+
+        HEAD_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid') || {
+          echo "::error::Failed to fetch PR #$PR_NUMBER. Verify the PR exists and you have read access."
+          exit 1
+        }
+        BASE_REF=$(gh pr view "$PR_NUMBER" --json baseRefName --jq '.baseRefName') || {
+          echo "::error::Failed to fetch base ref for PR #$PR_NUMBER"
+          exit 1
+        }
+
+        echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+        echo "head_sha=$HEAD_SHA"   >> "$GITHUB_OUTPUT"
+        echo "base_ref=$BASE_REF"   >> "$GITHUB_OUTPUT"
+        echo "Resolved: PR #$PR_NUMBER, base=$BASE_REF, sha=$HEAD_SHA"
+
+    # ── Step 2: React to the trigger comment ──────────────────────────────────
+    # Adds a 👀 reaction to acknowledge the request before the review starts.
+    # Only runs for issue_comment trigger; no-ops for pull_request.
+    - name: React to trigger comment
+      if: github.event_name == 'issue_comment'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        GH_REPO: ${{ github.repository }}
+        COMMENT_ID: ${{ github.event.comment.id }}
+      run: |
+        gh api repos/$GH_REPO/issues/comments/$COMMENT_ID/reactions \
+          -f content=eyes > /dev/null && echo "👀 reaction added" || \
+          echo "::warning::Failed to add reaction (may need 'issues: write' permission)"
+
+    # ── Step 3: Checkout at the PR head SHA ───────────────────────────────────
     - name: Checkout
       uses: actions/checkout@v4
       with:
+        ref: ${{ steps.pr_context.outputs.head_sha }}
         fetch-depth: 0
 
+    # ── Step 4: Generate diff ─────────────────────────────────────────────────
     - name: Generate diff
       shell: bash
+      env:
+        BASE_REF: ${{ steps.pr_context.outputs.base_ref }}
+        HEAD_SHA: ${{ steps.pr_context.outputs.head_sha }}
       run: |
-        BASE="${{ github.base_ref }}"
-        HEAD="${{ github.event.pull_request.head.sha }}"
-
-        # Build include pathspecs
         INCLUDE_SPEC=""
         IFS=',' read -ra INCLUDES <<< "${{ inputs.file_patterns }}"
         for p in "${INCLUDES[@]}"; do
-          p=$(echo "$p" | xargs)  # trim whitespace
-          INCLUDE_SPEC="$INCLUDE_SPEC $p"
+          p=$(echo "$p" | xargs)
+          INCLUDE_SPEC="$INCLUDE_SPEC \"$p\""
         done
 
-        # Generate the diff
-        git diff "origin/$BASE"...$HEAD -- $INCLUDE_SPEC > /tmp/pr_diff_raw.txt 2>/dev/null || \
-          git diff "origin/$BASE"...$HEAD > /tmp/pr_diff_raw.txt
+        git diff "origin/$BASE_REF"...$HEAD_SHA -- $INCLUDE_SPEC > /tmp/pr_diff_raw.txt 2>/dev/null || \
+          git diff "origin/$BASE_REF"...$HEAD_SHA > /tmp/pr_diff_raw.txt
 
-        # Apply exclude patterns using grep -v
         cp /tmp/pr_diff_raw.txt /tmp/pr_diff.txt
         IFS=',' read -ra EXCLUDES <<< "${{ inputs.exclude_patterns }}"
         for p in "${EXCLUDES[@]}"; do
           p=$(echo "$p" | xargs)
-          # Convert glob to a simple string match for diff --name filtering
           PATTERN=$(echo "$p" | sed 's/\*/.*/g')
           grep -v "^diff --git.*$PATTERN" /tmp/pr_diff.txt > /tmp/pr_diff_filtered.txt && \
             mv /tmp/pr_diff_filtered.txt /tmp/pr_diff.txt || true
@@ -122,6 +179,7 @@ runs:
         SIZE=$(wc -c < /tmp/pr_diff.txt)
         echo "Diff: $LINES lines, $SIZE bytes"
 
+    # ── Step 5: Run the AI review ─────────────────────────────────────────────
     - name: Run AI review
       id: run_review
       shell: python3 {0}
@@ -134,8 +192,11 @@ runs:
         INPUT_MAX_DIFF_CHARS: ${{ inputs.max_diff_chars }}
         INPUT_POST_MODE: ${{ inputs.post_mode }}
         INPUT_LANGUAGE: ${{ inputs.language }}
+        INPUT_TRIGGER_PHRASE: ${{ inputs.trigger_phrase }}
+        EVENT_NAME: ${{ github.event_name }}
+        COMMENT_BODY: ${{ github.event.comment.body }}
         GH_TOKEN: ${{ inputs.github_token }}
         GH_REPO: ${{ github.repository }}
-        GH_PR_NUMBER: ${{ github.event.pull_request.number }}
-        GH_SHA: ${{ github.event.pull_request.head.sha }}
+        GH_PR_NUMBER: ${{ steps.pr_context.outputs.pr_number }}
+        GH_SHA: ${{ steps.pr_context.outputs.head_sha }}
       run: ${{ github.action_path }}/review.py

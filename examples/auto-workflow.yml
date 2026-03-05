@@ -1,3 +1,8 @@
+# AI PR Review — automatic mode
+#
+# Posts a review on every push to a PR.
+# Copy this to .github/workflows/ai-review.yml in your repo.
+
 name: AI PR Review
 
 on:
