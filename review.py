@@ -139,6 +139,216 @@ def compare_findings(old: List[Finding], new: List[Finding], line_tolerance: int
     
     return resolved, persisting
 
+
+# ── GitHub API Helpers ────────────────────────────────────────────────────────
+
+def gh_post(url: str, payload: dict, retries: int = 3) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {gh_token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    last_error = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+            if e.code >= 500 and attempt < retries - 1:
+                last_error = f"HTTP {e.code}"
+                continue
+            print(f"::error::GitHub API returned HTTP {e.code}: {body}")
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                last_error = str(e.reason)
+                continue
+            print(f"::error::Failed to reach GitHub API: {e.reason}")
+            sys.exit(1)
+    print(f"::error::GitHub API failed after {retries} retries: {last_error}")
+    sys.exit(1)
+
+def gh_get(url: str, retries: int = 3) -> Union[dict, list]:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {gh_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    last_error = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+            if e.code >= 500 and attempt < retries - 1:
+                last_error = f"HTTP {e.code}"
+                continue
+            print(f"::error::GitHub API returned HTTP {e.code}: {body}")
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                last_error = str(e.reason)
+                continue
+            print(f"::error::Failed to reach GitHub API: {e.reason}")
+            sys.exit(1)
+    print(f"::error::GitHub API failed after {retries} retries: {last_error}")
+    sys.exit(1)
+
+def gh_patch(url: str, payload: dict, retries: int = 3) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {gh_token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method="PATCH",
+    )
+    last_error = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+            if e.code >= 500 and attempt < retries - 1:
+                last_error = f"HTTP {e.code}"
+                continue
+            print(f"::error::GitHub API returned HTTP {e.code}: {body}")
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                last_error = str(e.reason)
+                continue
+            print(f"::error::Failed to reach GitHub API: {e.reason}")
+            sys.exit(1)
+    print(f"::error::GitHub API failed after {retries} retries: {last_error}")
+    sys.exit(1)
+
+
+def gh_list_review_comments(pr_number: int, commit_id: str) -> List[dict]:
+    """
+    Fetch all review comments for a specific commit.
+    Returns comments with path, line, and body.
+    """
+    url = f"{base_gh}/pulls/{pr_number}/comments"
+    params = "?per_page=100&sort=created&direction=desc"
+    
+    all_comments = []
+    page = 1
+    
+    while page <= 10:  # Safety limit: 1000 comments
+        result = gh_get(f"{url}{params}&page={page}")
+        
+        if not isinstance(result, list) or not result:
+            break
+        
+        for comment in result:
+            # Only include comments on the current commit
+            if comment.get("commit_id") == commit_id:
+                all_comments.append({
+                    "path": comment.get("path"),
+                    "line": comment.get("line") or comment.get("original_line"),
+                    "body": comment.get("body", "")
+                })
+        
+        if len(result) < 100:  # Last page
+            break
+        
+        page += 1
+    
+    return all_comments
+
+def has_existing_comment(path: str, line: int, existing_comments: List[dict]) -> bool:
+    """
+    Check if a line already has a review comment.
+    Returns True if duplicate detected.
+    """
+    for comment in existing_comments:
+        if comment["path"] == path and comment["line"] == line:
+            return True
+    return False
+
+def findings_to_review_comments(findings: List[Finding]) -> List[dict]:
+    """
+    Convert parsed findings to GitHub review comment format.
+    Returns array suitable for PR review API.
+    """
+    comments = []
+    
+    severity_emoji = {
+        "critical": "🔴",
+        "warning": "🟡",
+        "suggestion": "🟢"
+    }
+    
+    for finding in findings:
+        # Skip findings without valid file/line info
+        if not finding.file_path or not finding.line_start:
+            continue
+        
+        emoji = severity_emoji.get(finding.severity, "⚠️")
+        comment_body = f"{emoji} **{finding.severity.title()}**\n\n{finding.text}"
+        
+        # Support multi-line ranges
+        if finding.line_end and finding.line_end != finding.line_start:
+            comments.append({
+                "path": finding.file_path,
+                "start_line": finding.line_start,
+                "line": finding.line_end,
+                "side": "RIGHT",
+                "body": comment_body
+            })
+        else:
+            comments.append({
+                "path": finding.file_path,
+                "line": finding.line_start,
+                "side": "RIGHT",
+                "body": comment_body
+            })
+    
+    return comments
+
+def mark_findings_resolved(comment_body: str, resolved_findings: List[Finding], resolved_sha: str) -> str:
+    """
+    Mark resolved findings with strikethrough in a comment body.
+    """
+    lines = comment_body.split('\n')
+    updated_lines = []
+    
+    for line in lines:
+        modified = False
+        for finding in resolved_findings:
+            if finding.raw_line in line and not line.strip().startswith('~~'):
+                if line.strip().startswith('- '):
+                    indent_match = re.match(r'^(\s*- )(.*)$', line)
+                    if indent_match:
+                        indent = indent_match.group(1)
+                        content = indent_match.group(2)
+                        updated_lines.append(f"{indent}~~{content}~~ ✅ Resolved in {resolved_sha[:7]}")
+                        modified = True
+                        break
+        
+        if not modified:
+            updated_lines.append(line)
+    
+    return '\n'.join(updated_lines)
+
+base_gh = f"https://api.github.com/repos/{gh_repo}"
 # ── Validate ──────────────────────────────────────────────────────────────────
 
 errors = []
@@ -315,11 +525,9 @@ usage = result.get("usage", {})
 if usage:
     print(f"Token usage — prompt: {usage.get('prompt_tokens', '?')}, completion: {usage.get('completion_tokens', '?')}")
 
-# ── Post to GitHub ────────────────────────────────────────────────────────────
+# ── Prepare review comment body ────────────────────────────────────────────────
 
-from datetime import datetime
-
-timestamp = datetime.utcnow().isoformat() + "Z"
+timestamp = datetime.now(timezone.utc).isoformat()
 review_comment_body = (
     f"## 🤖 AI Code Review\n"
     f"<!-- ai-pr-review sha={gh_sha} timestamp={timestamp} -->\n\n"
@@ -328,239 +536,7 @@ review_comment_body = (
     f"*Model: `{model}` · Commit: `{gh_sha[:7]}` · [ai-pr-review](https://github.com/hilleer/ai-pr-review)*"
 )
 
-def gh_post(url: str, payload: dict, retries: int = 3) -> dict:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Authorization": f"Bearer {gh_token}",
-            "Accept": "application/vnd.github+json",
-            "Content-Type": "application/json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
-    last_error = None
-    for attempt in range(retries):
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")[:500]
-            if e.code >= 500 and attempt < retries - 1:
-                last_error = f"HTTP {e.code}"
-                continue
-            print(f"::error::GitHub API returned HTTP {e.code}: {body}")
-            sys.exit(1)
-        except urllib.error.URLError as e:
-            if attempt < retries - 1:
-                last_error = str(e.reason)
-                continue
-            print(f"::error::Failed to reach GitHub API: {e.reason}")
-            sys.exit(1)
-    print(f"::error::GitHub API failed after {retries} retries: {last_error}")
-    sys.exit(1)
-
-def gh_get(url: str, retries: int = 3) -> Union[dict, list]:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {gh_token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
-    last_error = None
-    for attempt in range(retries):
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")[:500]
-            if e.code >= 500 and attempt < retries - 1:
-                last_error = f"HTTP {e.code}"
-                continue
-            print(f"::error::GitHub API returned HTTP {e.code}: {body}")
-            sys.exit(1)
-        except urllib.error.URLError as e:
-            if attempt < retries - 1:
-                last_error = str(e.reason)
-                continue
-            print(f"::error::Failed to reach GitHub API: {e.reason}")
-            sys.exit(1)
-    print(f"::error::GitHub API failed after {retries} retries: {last_error}")
-    sys.exit(1)
-
-def gh_patch(url: str, payload: dict, retries: int = 3) -> dict:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Authorization": f"Bearer {gh_token}",
-            "Accept": "application/vnd.github+json",
-            "Content-Type": "application/json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-        method="PATCH",
-    )
-    last_error = None
-    for attempt in range(retries):
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")[:500]
-            if e.code >= 500 and attempt < retries - 1:
-                last_error = f"HTTP {e.code}"
-                continue
-            print(f"::error::GitHub API returned HTTP {e.code}: {body}")
-            sys.exit(1)
-        except urllib.error.URLError as e:
-            if attempt < retries - 1:
-                last_error = str(e.reason)
-                continue
-            print(f"::error::Failed to reach GitHub API: {e.reason}")
-            sys.exit(1)
-    print(f"::error::GitHub API failed after {retries} retries: {last_error}")
-    sys.exit(1)
-
-def gh_list_pr_comments(pr_number: int) -> List[dict]:
-    url = f"{base_gh}/issues/{pr_number}/comments"
-    try:
-        result = gh_get(url)
-        return result if isinstance(result, list) else []
-    except Exception as e:
-        print(f"::warning::Failed to list PR comments: {e}")
-        return []
-
-def gh_edit_comment(comment_id: int, body: str) -> dict:
-    url = f"{base_gh}/issues/comments/{comment_id}"
-    return gh_patch(url, {"body": body})
-
-def find_last_ai_review_comment(comments: List[dict]) -> Optional[dict]:
-    for comment in reversed(comments):
-        body = comment.get("body", "")
-        if "<!-- ai-pr-review" in body:
-            return comment
-    return None
-
-def extract_sha_from_comment(body: str) -> Optional[str]:
-    match = re.search(r'<!-- ai-pr-review sha=([a-f0-9]+)', body)
-    return match.group(1) if match else None
-
-def format_resolved_finding(finding: Finding, resolved_sha: str) -> str:
-    return f"- ~~{finding.raw_line}~~ ✅ Resolved in {resolved_sha[:7]}"
-
-def mark_findings_resolved(comment_body: str, resolved_findings: List[Finding], resolved_sha: str) -> str:
-    lines = comment_body.split('\n')
-    updated_lines = []
-    
-    for line in lines:
-        modified = False
-        for finding in resolved_findings:
-            if finding.raw_line in line and not line.strip().startswith('~~'):
-                if line.strip().startswith('- '):
-                    indent_match = re.match(r'^(\s*- )(.*)$', line)
-                    if indent_match:
-                        indent = indent_match.group(1)
-                        content = indent_match.group(2)
-                        updated_lines.append(f"{indent}~~{content}~~ ✅ Resolved in {resolved_sha[:7]}")
-                        modified = True
-                        break
-        
-        if not modified:
-            updated_lines.append(line)
-    
-    return '\n'.join(updated_lines)
-
-# ── Per-line comment helpers ──────────────────────────────────────────────────
-
-def gh_list_review_comments(pr_number: int, commit_id: str) -> List[dict]:
-    """
-    Fetch all review comments for a specific commit.
-    Returns comments with path, line, and body.
-    """
-    url = f"{base_gh}/pulls/{pr_number}/comments"
-    params = "?per_page=100&sort=created&direction=desc"
-    
-    all_comments = []
-    page = 1
-    
-    while page <= 10:  # Safety limit: 1000 comments
-        result = gh_get(f"{url}{params}&page={page}")
-        
-        if not isinstance(result, list) or not result:
-            break
-        
-        for comment in result:
-            # Only include comments on the current commit
-            if comment.get("commit_id") == commit_id:
-                all_comments.append({
-                    "path": comment.get("path"),
-                    "line": comment.get("line") or comment.get("original_line"),
-                    "body": comment.get("body", "")
-                })
-        
-        if len(result) < 100:  # Last page
-            break
-        
-        page += 1
-    
-    return all_comments
-
-def has_existing_comment(path: str, line: int, existing_comments: List[dict]) -> bool:
-    """
-    Check if a line already has a review comment.
-    Returns True if duplicate detected.
-    """
-    for comment in existing_comments:
-        if comment["path"] == path and comment["line"] == line:
-            return True
-    return False
-
-def findings_to_review_comments(findings: List[Finding]) -> List[dict]:
-    """
-    Convert parsed findings to GitHub review comment format.
-    Returns array suitable for PR review API.
-    """
-    comments = []
-    
-    severity_emoji = {
-        "critical": "🔴",
-        "warning": "🟡",
-        "suggestion": "🟢"
-    }
-    
-    for finding in findings:
-        # Skip findings without valid file/line info
-        if not finding.file_path or not finding.line_start:
-            continue
-        
-        emoji = severity_emoji.get(finding.severity, "⚠️")
-        comment_body = f"{emoji} **{finding.severity.title()}**\n\n{finding.text}"
-        
-        # Support multi-line ranges
-        if finding.line_end and finding.line_end != finding.line_start:
-            comments.append({
-                "path": finding.file_path,
-                "start_line": finding.line_start,
-                "line": finding.line_end,
-                "side": "RIGHT",
-                "body": comment_body
-            })
-        else:
-            comments.append({
-                "path": finding.file_path,
-                "line": finding.line_start,
-                "side": "RIGHT",
-                "body": comment_body
-            })
-    
-    return comments
-
-base_gh = f"https://api.github.com/repos/{gh_repo}"
-
+# ── Post to GitHub ────────────────────────────────────────────────────────────
 # ── Prepare PR Review ─────────────────────────────────────────────────────────
 
 # Fetch existing review comments on current commit

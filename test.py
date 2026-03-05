@@ -2,6 +2,15 @@
 """
 Smoke tests for ai-pr-review.
 Run with: python3 test.py
+
+NOTE: These tests use local implementations of parse_findings, extract_file_and_line,
+and compare_findings rather than importing from review.py. This is intentional because
+importing review.py would execute module-level code that expects environment setup
+(diff files, GitHub API tokens, etc.).
+
+IDEALLY: review.py should be refactored to separate function definitions from
+module-level execution, allowing tests to import functions directly.
+See: https://github.com/hilleer/ai-pr-review/pull/6#discussion_rXXX
 """
 
 import json
