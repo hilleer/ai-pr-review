@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 AI PR Review — provider-agnostic code review via any OpenAI-compatible API.
+Works with both pull_request and issue_comment trigger events.
 """
 
 import json
@@ -19,6 +20,9 @@ max_tokens     = int(os.environ.get("INPUT_MAX_TOKENS", "2048"))
 max_diff_chars = int(os.environ.get("INPUT_MAX_DIFF_CHARS", "80000"))
 post_mode      = os.environ.get("INPUT_POST_MODE", "comment").strip().lower()
 language       = os.environ.get("INPUT_LANGUAGE", "english").strip()
+trigger_phrase = os.environ.get("INPUT_TRIGGER_PHRASE", "/ai-review").strip()
+event_name     = os.environ.get("EVENT_NAME", "").strip()
+comment_body   = os.environ.get("COMMENT_BODY", "").strip()
 gh_token       = os.environ.get("GH_TOKEN", "").strip()
 gh_repo        = os.environ.get("GH_REPO", "").strip()
 gh_pr_number   = os.environ.get("GH_PR_NUMBER", "").strip()
@@ -36,14 +40,22 @@ if not model:
 if not gh_token:
     errors.append("GitHub token is missing")
 if not gh_repo or not gh_pr_number:
-    errors.append("GitHub repo/PR context is missing — is this running on a pull_request event?")
+    errors.append(
+        "GitHub repo/PR context is missing — is this running on a "
+        "pull_request or issue_comment event?"
+    )
 
 if errors:
     for e in errors:
         print(f"::error::{e}")
     sys.exit(1)
 
-# Normalise base_url → always points to chat/completions
+if event_name == "issue_comment":
+    if trigger_phrase not in comment_body:
+        print(f"::notice::Comment doesn't contain trigger phrase '{trigger_phrase}'. Skipping.")
+        sys.exit(0)
+
+# Normalise base_url → always ends at /chat/completions
 if base_url.endswith("/chat/completions"):
     completions_url = base_url
 else:
@@ -66,12 +78,14 @@ if not diff:
 if len(diff) > max_diff_chars:
     truncated_at = max_diff_chars
     diff = diff[:truncated_at]
-    # Don't cut in the middle of a line
     last_newline = diff.rfind("\n")
     if last_newline > 0:
         diff = diff[:last_newline]
     diff += f"\n\n[... diff truncated at {truncated_at:,} chars to fit context window ...]"
-    print(f"::warning::Diff was truncated at {truncated_at:,} chars. Consider increasing max_diff_chars or scoping file_patterns.")
+    print(
+        f"::warning::Diff was truncated at {truncated_at:,} chars. "
+        "Consider increasing max_diff_chars or narrowing file_patterns."
+    )
 
 # ── Build prompts ─────────────────────────────────────────────────────────────
 
@@ -154,19 +168,15 @@ except Exception as e:
     print(f"::error::Unexpected error calling API: {e}")
     sys.exit(1)
 
-# Extract response text — handle both standard and some non-standard shapes
 try:
     review_text = result["choices"][0]["message"]["content"]
-except (KeyError, IndexError) as e:
+except (KeyError, IndexError):
     print(f"::error::Unexpected API response shape: {json.dumps(result)[:500]}")
     sys.exit(1)
 
-# Log token usage if the provider returns it
 usage = result.get("usage", {})
 if usage:
-    prompt_tokens     = usage.get("prompt_tokens", "?")
-    completion_tokens = usage.get("completion_tokens", "?")
-    print(f"Token usage — prompt: {prompt_tokens}, completion: {completion_tokens}")
+    print(f"Token usage — prompt: {usage.get('prompt_tokens', '?')}, completion: {usage.get('completion_tokens', '?')}")
 
 # ── Post to GitHub ────────────────────────────────────────────────────────────
 
@@ -202,11 +212,7 @@ base_gh = f"https://api.github.com/repos/{gh_repo}"
 if post_mode == "review":
     gh_post(
         f"{base_gh}/pulls/{gh_pr_number}/reviews",
-        {
-            "commit_id": gh_sha,
-            "body": comment_body,
-            "event": "COMMENT",
-        },
+        {"commit_id": gh_sha, "body": comment_body, "event": "COMMENT"},
     )
     print("Review posted to PR Reviews tab.")
 else:
@@ -221,7 +227,6 @@ else:
 github_output = os.environ.get("GITHUB_OUTPUT", "")
 if github_output:
     with open(github_output, "a") as f:
-        # Truncate to avoid issues with very long output values
         preview = review_text[:1000].replace("\n", "%0A").replace("\r", "")
         f.write(f"review_body={preview}\n")
         f.write(f"model_used={model}\n")

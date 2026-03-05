@@ -1,0 +1,41 @@
+# AI PR Review — on-demand mode
+#
+# Posts a review only when a PR comment contains the trigger phrase (default: /ai-review).
+# Works like @cursor or GitHub Copilot's slash commands.
+# Copy this to .github/workflows/ai-review-on-demand.yml in your repo.
+
+name: AI PR Review (on-demand)
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  review:
+    # Only run when:
+    #   1. The comment is on a PR (not a plain issue)
+    #   2. The comment body contains the trigger phrase
+    if: |
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/ai-review')
+
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - uses: hilleer/ai-pr-review@v1
+        with:
+          # --- Required ---
+          api_key: ${{ secrets.AI_API_KEY }}
+          base_url: https://api.moonshot.cn/v1
+          model: kimi-k2-0711-preview
+
+          # --- Optional ---
+          trigger_phrase: '/ai-review'               # must match the if: condition above
+          # language: english
+          # post_mode: comment
+          # system_prompt: ''
+          # max_tokens: 2048
+          # max_diff_chars: 80000

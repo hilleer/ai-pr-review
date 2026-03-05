@@ -4,11 +4,15 @@ A GitHub Action that posts an AI code review on pull requests using **any OpenAI
 
 No vendor lock-in. No hardcoded model names. Just point it at an endpoint.
 
-This is a proof-of-concept and exploration as an attempt to utilize API keys of different providers to do code reviews.
+Supports two modes:
+- **Automatic** — fires on every push to a PR
+- **On-demand** — fires only when a PR comment contains a trigger phrase (like `/ai-review`)
 
 ---
 
 ## Quick start
+
+### Automatic (fires on every PR push)
 
 ```yaml
 # .github/workflows/ai-review.yml
@@ -31,7 +35,36 @@ jobs:
           model: kimi-k2-0711-preview
 ```
 
-Add your API key as a repository secret named `AI_API_KEY` (Settings → Secrets and variables → Actions), and you're done.
+### On-demand (comment `/ai-review` on any PR)
+
+```yaml
+# .github/workflows/ai-review-on-demand.yml
+name: AI PR Review (on-demand)
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  review:
+    if: |
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/ai-review')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: hilleer/ai-pr-review@v1
+        with:
+          api_key: ${{ secrets.AI_API_KEY }}
+          base_url: https://api.moonshot.cn/v1
+          model: kimi-k2-0711-preview
+          trigger_phrase: '/ai-review'
+```
+
+When triggered by a comment, the action automatically adds a 👀 reaction to acknowledge the request before the review starts.
+
+Add your API key as a repository secret named `AI_API_KEY` (Settings → Secrets and variables → Actions).
 
 ---
 
@@ -59,6 +92,7 @@ Any provider that exposes an OpenAI-compatible `/chat/completions` endpoint work
 | `api_key` | ✅ | — | API key for your provider |
 | `base_url` | ✅ | — | Base URL of the OpenAI-compatible API |
 | `model` | ✅ | — | Model name to use |
+| `trigger_phrase` | | `/ai-review` | Comment phrase for on-demand mode |
 | `system_prompt` | | built-in | Custom system prompt |
 | `language` | | `english` | Language for the review response |
 | `post_mode` | | `comment` | `comment` (PR comment) or `review` (Reviews tab) |
@@ -78,8 +112,6 @@ Any provider that exposes an OpenAI-compatible `/chat/completions` endpoint work
 ---
 
 ## Custom system prompt
-
-You can fully replace the built-in prompt — useful if you want domain-specific review focus:
 
 ```yaml
 - uses: hilleer/ai-pr-review@v1
@@ -101,7 +133,7 @@ You can fully replace the built-in prompt — useful if you want domain-specific
 
 ## Dual-provider review
 
-Run two models in parallel to get independent perspectives:
+Run two models in parallel for independent perspectives:
 
 ```yaml
 jobs:
@@ -134,10 +166,17 @@ jobs:
 
 ## How it works
 
-1. Checks out the repository with full history
-2. Generates a `git diff` between the PR branch and base, filtered to relevant files
+**Automatic mode (`pull_request` event)**
+1. Checks out the PR head
+2. Generates a `git diff` against the base branch, filtered to relevant files
 3. Sends the diff to the model with a structured code review prompt
 4. Posts the response as a PR comment or GitHub Review
+
+**On-demand mode (`issue_comment` event)**
+1. Checks the comment body for the trigger phrase
+2. Adds a 👀 reaction to acknowledge the request
+3. Fetches the PR head SHA and base ref from the GitHub API
+4. Follows the same steps 1–4 as automatic mode
 
 The action uses only Python stdlib and shell builtins — no npm install, no Docker, fast startup.
 
