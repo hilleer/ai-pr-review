@@ -1,0 +1,141 @@
+name: 'AI PR Review'
+description: 'Post an AI code review on pull requests using any OpenAI-compatible API endpoint'
+author: 'hilleer'
+
+branding:
+  icon: 'eye'
+  color: 'blue'
+
+inputs:
+  api_key:
+    description: 'API key for your model provider'
+    required: true
+
+  base_url:
+    description: |
+      Base URL for the OpenAI-compatible chat completions API.
+      Examples:
+        Moonshot (Kimi):  https://api.moonshot.cn/v1
+        Zhipu (GLM):      https://open.bigmodel.cn/api/paas/v4
+        OpenAI:           https://api.openai.com/v1
+        Mistral:          https://api.mistral.ai/v1
+        Groq:             https://api.groq.com/openai/v1
+        Together:         https://api.together.xyz/v1
+        DeepSeek:         https://api.deepseek.com/v1
+        Local (Ollama):   http://localhost:11434/v1
+    required: true
+
+  model:
+    description: 'Model name (e.g. kimi-k2-0711-preview, glm-4-plus, gpt-4o, mistral-large-latest)'
+    required: true
+
+  system_prompt:
+    description: 'Custom system prompt. Leave empty to use the built-in code review prompt.'
+    required: false
+    default: ''
+
+  file_patterns:
+    description: 'Comma-separated glob patterns of files to include in the review'
+    required: false
+    default: '*.ts,*.tsx,*.js,*.jsx,*.py,*.go,*.java,*.cs,*.rb,*.rs,*.cpp,*.c,*.h'
+
+  exclude_patterns:
+    description: 'Comma-separated glob patterns of files to exclude from the review'
+    required: false
+    default: '*.lock,*.snap,*-lock.json,*.min.js,dist/*,build/*,node_modules/*'
+
+  max_tokens:
+    description: 'Maximum tokens in the model response'
+    required: false
+    default: '2048'
+
+  max_diff_chars:
+    description: 'Maximum characters of diff to send. Increase for models with large context windows.'
+    required: false
+    default: '80000'
+
+  post_mode:
+    description: |
+      How to post the review:
+        comment  - Single PR comment (default, works everywhere)
+        review   - GitHub PR Review (shows in the Reviews tab)
+    required: false
+    default: 'comment'
+
+  language:
+    description: 'Language for the review response (e.g. english, danish, german)'
+    required: false
+    default: 'english'
+
+  github_token:
+    description: 'GitHub token for posting comments. Defaults to the built-in GITHUB_TOKEN.'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  review_body:
+    description: 'The review text returned by the model (first 1000 chars)'
+    value: ${{ steps.run_review.outputs.review_body }}
+
+  model_used:
+    description: 'The model that performed the review'
+    value: ${{ steps.run_review.outputs.model_used }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Generate diff
+      shell: bash
+      run: |
+        BASE="${{ github.base_ref }}"
+        HEAD="${{ github.event.pull_request.head.sha }}"
+
+        # Build include pathspecs
+        INCLUDE_SPEC=""
+        IFS=',' read -ra INCLUDES <<< "${{ inputs.file_patterns }}"
+        for p in "${INCLUDES[@]}"; do
+          p=$(echo "$p" | xargs)  # trim whitespace
+          INCLUDE_SPEC="$INCLUDE_SPEC $p"
+        done
+
+        # Generate the diff
+        git diff "origin/$BASE"...$HEAD -- $INCLUDE_SPEC > /tmp/pr_diff_raw.txt 2>/dev/null || \
+          git diff "origin/$BASE"...$HEAD > /tmp/pr_diff_raw.txt
+
+        # Apply exclude patterns using grep -v
+        cp /tmp/pr_diff_raw.txt /tmp/pr_diff.txt
+        IFS=',' read -ra EXCLUDES <<< "${{ inputs.exclude_patterns }}"
+        for p in "${EXCLUDES[@]}"; do
+          p=$(echo "$p" | xargs)
+          # Convert glob to a simple string match for diff --name filtering
+          PATTERN=$(echo "$p" | sed 's/\*/.*/g')
+          grep -v "^diff --git.*$PATTERN" /tmp/pr_diff.txt > /tmp/pr_diff_filtered.txt && \
+            mv /tmp/pr_diff_filtered.txt /tmp/pr_diff.txt || true
+        done
+
+        LINES=$(wc -l < /tmp/pr_diff.txt)
+        SIZE=$(wc -c < /tmp/pr_diff.txt)
+        echo "Diff: $LINES lines, $SIZE bytes"
+
+    - name: Run AI review
+      id: run_review
+      shell: python3 {0}
+      env:
+        INPUT_API_KEY: ${{ inputs.api_key }}
+        INPUT_BASE_URL: ${{ inputs.base_url }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_SYSTEM_PROMPT: ${{ inputs.system_prompt }}
+        INPUT_MAX_TOKENS: ${{ inputs.max_tokens }}
+        INPUT_MAX_DIFF_CHARS: ${{ inputs.max_diff_chars }}
+        INPUT_POST_MODE: ${{ inputs.post_mode }}
+        INPUT_LANGUAGE: ${{ inputs.language }}
+        GH_TOKEN: ${{ inputs.github_token }}
+        GH_REPO: ${{ github.repository }}
+        GH_PR_NUMBER: ${{ github.event.pull_request.number }}
+        GH_SHA: ${{ github.event.pull_request.head.sha }}
+      run: ${{ github.action_path }}/review.py

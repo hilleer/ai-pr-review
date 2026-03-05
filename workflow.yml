@@ -1,0 +1,29 @@
+name: AI PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - uses: hilleer/ai-pr-review@v1
+        with:
+          # --- Required ---
+          api_key: ${{ secrets.AI_API_KEY }}
+          base_url: https://api.moonshot.cn/v1        # swap for any provider
+          model: kimi-k2-0711-preview                  # swap for any model
+
+          # --- Optional ---
+          # system_prompt: ''                          # custom prompt; leave empty for default
+          # language: english                          # review language
+          # post_mode: comment                         # 'comment' or 'review'
+          # max_tokens: 2048
+          # max_diff_chars: 80000                      # raise for large-context models
+          # file_patterns: '*.ts,*.tsx,*.js,*.py'     # which files to include
+          # exclude_patterns: '*.lock,dist/*'          # which files to skip
