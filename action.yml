@@ -66,7 +66,8 @@ inputs:
     description: |
       How to post the review:
         comment  - Single PR comment (default, works everywhere)
-        review   - GitHub PR Review (shows in the Reviews tab)
+        review   - GitHub PR Review (shows in the Reviews tab, informational only)
+      Note: 'review' mode posts as COMMENT event (doesn't approve or request changes).
     required: false
     default: 'comment'
 
@@ -150,21 +151,29 @@ runs:
         fetch-depth: 0
 
     # ── Step 4: Generate diff ─────────────────────────────────────────────────
+    # Uses three-dot diff (A...B) which shows changes from the merge base of A and B.
+    # This shows only changes introduced by the PR, not changes from the base branch.
     - name: Generate diff
       shell: bash
       env:
         BASE_REF: ${{ steps.pr_context.outputs.base_ref }}
         HEAD_SHA: ${{ steps.pr_context.outputs.head_sha }}
       run: |
-        INCLUDE_SPEC=""
+        INCLUDE_ARRAY=()
         IFS=',' read -ra INCLUDES <<< "${{ inputs.file_patterns }}"
         for p in "${INCLUDES[@]}"; do
           p=$(echo "$p" | xargs)
-          INCLUDE_SPEC="$INCLUDE_SPEC \"$p\""
+          INCLUDE_ARRAY+=("$p")
         done
 
-        git diff "origin/$BASE_REF"...$HEAD_SHA -- $INCLUDE_SPEC > /tmp/pr_diff_raw.txt 2>/dev/null || \
+        if [ ${#INCLUDE_ARRAY[@]} -gt 0 ]; then
+          git diff "origin/$BASE_REF"...$HEAD_SHA -- "${INCLUDE_ARRAY[@]}" > /tmp/pr_diff_raw.txt 2>/dev/null || {
+            echo "::warning::Filtered diff failed, falling back to unfiltered diff"
+            git diff "origin/$BASE_REF"...$HEAD_SHA > /tmp/pr_diff_raw.txt
+          }
+        else
           git diff "origin/$BASE_REF"...$HEAD_SHA > /tmp/pr_diff_raw.txt
+        fi
 
         cp /tmp/pr_diff_raw.txt /tmp/pr_diff.txt
         IFS=',' read -ra EXCLUDES <<< "${{ inputs.exclude_patterns }}"
