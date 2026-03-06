@@ -261,6 +261,7 @@ def gh_list_review_comments(pr_number: int, commit_id: str, base_gh: str, gh_tok
             if comment.get("commit_id") == commit_id:
                 all_comments.append({
                     "path": comment.get("path"),
+                    "start_line": comment.get("start_line") or comment.get("original_start_line"),
                     "line": comment.get("line") or comment.get("original_line"),
                     "body": comment.get("body", "")
                 })
@@ -272,14 +273,20 @@ def gh_list_review_comments(pr_number: int, commit_id: str, base_gh: str, gh_tok
 
     return all_comments
 
-def has_existing_comment(path: str, line: int, existing_comments: List[dict]) -> bool:
+def has_existing_comment(path: str, line_start: int, line_end: int, existing_comments: List[dict]) -> bool:
     """
-    Check if a line already has a review comment.
-    Returns True if duplicate detected.
+    Check if a line range already has a review comment.
+    Returns True if duplicate detected (any overlap).
     """
     for comment in existing_comments:
-        if comment["path"] == path and comment["line"] == line:
-            return True
+        if comment["path"] == path:
+            # Get the existing comment's line range
+            existing_start = comment.get("start_line") or comment["line"]
+            existing_end = comment["line"]
+            
+            # Check for overlap: ranges overlap if start1 <= end2 and start2 <= end1
+            if line_start <= existing_end and line_end >= existing_start:
+                return True
     return False
 
 def findings_to_review_comments(findings: List[Finding]) -> List[dict]:
@@ -308,6 +315,7 @@ def findings_to_review_comments(findings: List[Finding]) -> List[dict]:
             comments.append({
                 "path": finding.file_path,
                 "start_line": finding.line_start,
+                "start_side": "RIGHT",
                 "line": finding.line_end,
                 "side": "RIGHT",
                 "body": comment_body
