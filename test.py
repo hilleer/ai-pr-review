@@ -3,38 +3,33 @@
 Smoke tests for ai-pr-review.
 Run with: python3 test.py
 
-NOTE: These tests use local implementations of parse_findings, extract_file_and_line,
-and compare_findings rather than importing from review.py. This is intentional because
-importing review.py would execute module-level code that expects environment setup
-(diff files, GitHub API tokens, etc.).
+ARCHITECTURE NOTE:
+These tests import directly from review.py, This is now safe because all module-level
+execution has been moved into main(), eliminating the need for environment setup
+before importing.
 
-IDEALLY: review.py should be refactored to separate function definitions from
-module-level execution, allowing tests to import functions directly.
-See: https://github.com/hilleer/ai-pr-review/pull/6#discussion_rXXX
+HISTORICAL CONTEXT:
+Previously, tests used local implementations of parse_findings, extract_file_and_line,
+and compare_findings because importing review.py would execute module-level code
+that required environment setup (GitHub tokens, diff files, etc.).
+
+The refactoring to wrap all execution in main() solved this problem, enabling tests
+to verify actual production code rather than duplicates.
+
+CAVEAT:
+GitHub API helper functions (gh_get, gh_post, gh_patch, gh_list_review_comments) accept
+gh_token as an explicit parameter rather than relying on global state. This makes
+dependencies clear and improves testability.
+
+See: https://github.com/hilleer/ai-pr-review/pull/6
 """
 
-import json
-import os
 import sys
 import tempfile
 import unittest
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Optional
 
-os.environ.update({
-    "INPUT_API_KEY": "test-key",
-    "INPUT_BASE_URL": "https://api.example.com/v1",
-    "INPUT_MODEL": "test-model",
-    "INPUT_SYSTEM_PROMPT": "",
-    "INPUT_MAX_TOKENS": "2048",
-    "INPUT_MAX_DIFF_CHARS": "80000",
-    "INPUT_LANGUAGE": "english",
-    "INPUT_DEBOUNCE_MINUTES": "1",
-    "GH_TOKEN": "ghp_test",
-    "GH_REPO": "owner/repo",
-    "GH_PR_NUMBER": "42",
-    "GH_SHA": "abc123",
-})
+from review import Finding, parse_findings, extract_file_and_line, compare_findings
 
 
 class TestURLNormalisation(unittest.TestCase):
@@ -138,103 +133,6 @@ class TestOnDemandTrigger(unittest.TestCase):
 
     def test_case_insensitive(self):
         self.assertTrue(self._should_trigger("/AI-REVIEW", "/ai-review"))
-
-
-@dataclass
-class Finding:
-    file_path: str
-    line_start: int
-    line_end: int
-    severity: str
-    text: str
-    raw_line: str
-
-
-def parse_findings(review_text: str) -> List[Finding]:
-    import re
-    findings = []
-    
-    sections = {
-        'critical': r'### 🔴 Critical\s*\n(.*?)(?=### |## |$)',
-        'warning': r'### 🟡 Warning\s*\n(.*?)(?=### |## |$)',
-        'suggestion': r'### 🟢 Suggestion\s*\n(.*?)(?=### |## |$)'
-    }
-    
-    for severity, pattern in sections.items():
-        match = re.search(pattern, review_text, re.DOTALL | re.IGNORECASE)
-        if not match:
-            continue
-        
-        section_text = match.group(1)
-        lines = section_text.strip().split('\n')
-        
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            
-            file_path, line_start, line_end = extract_file_and_line(line)
-            if file_path and line_start and line_end:
-                findings.append(Finding(
-                    file_path=file_path,
-                    line_start=line_start,
-                    line_end=line_end,
-                    severity=severity,
-                    text=line,
-                    raw_line=line
-                ))
-    
-    return findings
-
-
-def extract_file_and_line(text: str) -> Tuple[Optional[str], Optional[int], Optional[int]]:
-    import re
-    patterns = [
-        r'([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+):(\d+)-(\d+)',
-        r'([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+):(\d+)',
-        r'[Ff]ile[:\s]+([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)[,\s]+[Ll]ine[:\s]+(\d+)',
-        r'[Ii]n\s+([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)\s+at\s+line\s+(\d+)',
-        r'[Ll]ines?\s+(\d+)-?(\d+)?\s+(?:of|in)\s+([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)',
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            groups = match.groups()
-            
-            if pattern == patterns[0]:
-                return groups[0], int(groups[1]), int(groups[2])
-            elif pattern == patterns[1]:
-                return groups[0], int(groups[1]), int(groups[1])
-            elif pattern in [patterns[2], patterns[3]]:
-                return groups[0], int(groups[1]), int(groups[1])
-            elif pattern == patterns[4]:
-                file_path = groups[2]
-                line_start = int(groups[0])
-                line_end = int(groups[1]) if groups[1] else line_start
-                return file_path, line_start, line_end
-    
-    return None, None, None
-
-
-def compare_findings(old: List[Finding], new: List[Finding], line_tolerance: int = 5) -> Tuple[List[Finding], List[Finding]]:
-    resolved = []
-    persisting = []
-    
-    for old_finding in old:
-        is_resolved = True
-        
-        for new_finding in new:
-            if (old_finding.file_path == new_finding.file_path and
-                abs(old_finding.line_start - new_finding.line_start) <= line_tolerance):
-                is_resolved = False
-                persisting.append(old_finding)
-                break
-        
-        if is_resolved:
-            resolved.append(old_finding)
-    
-    return resolved, persisting
 
 
 class TestFindingsParser(unittest.TestCase):
@@ -391,13 +289,116 @@ class TestDebounceLogic(unittest.TestCase):
         self.assertGreaterEqual(val, 0)
 
 
+class TestReviewModuleImports(unittest.TestCase):
+    """Verify that review.py can be imported without side effects"""
+    
+    def test_can_import_review_without_environment(self):
+        """
+        Verify that importing review.py doesn't execute module-level code
+        or require environment setup.
+        
+        This test ensures the architectural refactoring (moving code to main())
+        is maintained and prevents regressions.
+        """
+        # Remove from sys.modules if already imported
+        if 'review' in sys.modules:
+            del sys.modules['review']
+        
+        # Import should not raise or execute code
+        import review
+        
+        # Verify functions exist
+        self.assertTrue(hasattr(review, 'parse_findings'))
+        self.assertTrue(hasattr(review, 'extract_file_and_line'))
+        self.assertTrue(hasattr(review, 'compare_findings'))
+        self.assertTrue(hasattr(review, 'main'))
+    
+    def test_review_does_not_execute_on_import(self):
+        """
+        Verify that importing review.py doesn't attempt API calls or
+        other operations that would fail without environment.
+        """
+        if 'review' in sys.modules:
+            del sys.modules['review']
+        
+        # This should succeed even without environment variables
+        try:
+            import review
+            # If we get here, import was safe
+            self.assertTrue(True)
+        except Exception as e:
+            self.fail(f"Importing review.py raised exception: {e}")
+
+
+class TestGitHubAPIHelpers(unittest.TestCase):
+    """
+    Test that GitHub API helper functions require gh_token parameter.
+    
+    This ensures the bug fix (adding gh_token parameters) is maintained
+    and prevents regression to global variable approach.
+    """
+    
+    def test_gh_post_requires_token_parameter(self):
+        """Verify gh_post signature includes gh_token"""
+        import inspect
+        from review import gh_post
+        
+        sig = inspect.signature(gh_post)
+        params = list(sig.parameters.keys())
+        
+        self.assertIn('gh_token', params, 
+            "gh_post must accept gh_token as parameter (not global)")
+        self.assertIn('url', params)
+        self.assertIn('payload', params)
+    
+    def test_gh_get_requires_token_parameter(self):
+        """Verify gh_get signature includes gh_token"""
+        import inspect
+        from review import gh_get
+        
+        sig = inspect.signature(gh_get)
+        params = list(sig.parameters.keys())
+        
+        self.assertIn('gh_token', params,
+            "gh_get must accept gh_token as parameter (not global)")
+        self.assertIn('url', params)
+    
+    def test_gh_patch_requires_token_parameter(self):
+        """Verify gh_patch signature includes gh_token"""
+        import inspect
+        from review import gh_patch
+        
+        sig = inspect.signature(gh_patch)
+        params = list(sig.parameters.keys())
+        
+        self.assertIn('gh_token', params,
+            "gh_patch must accept gh_token as parameter (not global)")
+        self.assertIn('url', params)
+        self.assertIn('payload', params)
+    
+    def test_gh_list_review_comments_requires_token_parameter(self):
+        """Verify gh_list_review_comments signature includes gh_token"""
+        import inspect
+        from review import gh_list_review_comments
+        
+        sig = inspect.signature(gh_list_review_comments)
+        params = list(sig.parameters.keys())
+        
+        self.assertIn('gh_token', params,
+            "gh_list_review_comments must accept gh_token as parameter")
+        self.assertIn('pr_number', params)
+        self.assertIn('commit_id', params)
+        self.assertIn('base_gh', params)
+
+
 if __name__ == "__main__":
     print("Running ai-pr-review smoke tests...\n")
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     for cls in [TestURLNormalisation, TestDiffHandling, TestLanguageNote, 
                 TestOnDemandTrigger, TestFindingsParser, TestFindingsComparison,
-                TestPerLineComments, TestDebounceLogic]:
+                TestPerLineComments, TestDebounceLogic,
+                TestReviewModuleImports, TestGitHubAPIHelpers]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
